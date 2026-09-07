@@ -31,6 +31,7 @@ func TestSetSection(t *testing.T) {
 						if !bytes.Equal(original, pristine) {
 							t.Fatal("input mutated")
 						}
+						assertPreserved(t, original, out)
 						after := openELF(t, out)
 						section := after.Section(".note.example")
 						if section == nil || section.Type != opts.Type || section.Flags != opts.Flags || section.Addralign != opts.Alignment || section.Offset%opts.Alignment != 0 {
@@ -56,13 +57,6 @@ func TestSetSection(t *testing.T) {
 							if !reflect.DeepEqual(after.Sections[i].SectionHeader, before.Sections[i].SectionHeader) {
 								t.Fatalf("section %d header changed", i)
 							}
-						}
-						headerSize := 64
-						if enc.class == elf.ELFCLASS32 {
-							headerSize = 52
-						}
-						if !bytes.Equal(original[headerSize:], out[headerSize:len(original)]) {
-							t.Fatal("existing file bytes changed")
 						}
 						if after.Sections[1].Offset%after.Sections[1].Addralign != 0 {
 							t.Fatal("string table lost alignment")
@@ -240,15 +234,35 @@ func TestIOAndCancellation(t *testing.T) {
 func FuzzSetSection(f *testing.F) {
 	for _, enc := range encodings {
 		f.Add(fixture(f, enc, elf.EM_ARM, 5, false))
+		inactive := fixture(f, enc, elf.EM_ARM, 5, false)
+		copy(inactive[256+22:], []byte(".fuzz\x00"))
+		putFixtureSection(f, enc, inactive, 4, elf.Section64{Name: 22})
+		f.Add(inactive)
 	}
 	f.Add([]byte("not ELF"))
 	f.Fuzz(func(t *testing.T, input []byte) {
-		out, err := SetSection(context.Background(), input, ".fuzz", []byte("data"), SectionOptions{})
+		out, err := SetSection(context.Background(), input, ".fuzz", []byte("data"), SectionOptions{MaxOutputSize: uint64(len(input)) + 1<<20})
 		if err != nil {
 			return
 		}
+		assertPreserved(t, input, out)
+		// The editor preserves opaque metadata that debug/elf may reject already
+		// in the input (e.g. undefined fields of inactive SHT_NULL entries).
+		before, err := elf.NewFile(bytes.NewReader(input))
+		if err != nil {
+			return
+		}
+		if err := before.Close(); err != nil {
+			t.Fatal(err)
+		}
 		file := openELF(t, out)
-		section := file.Section(".fuzz")
+		var section *elf.Section
+		for _, candidate := range file.Sections {
+			if candidate.Type != elf.SHT_NULL && candidate.Name == ".fuzz" {
+				section = candidate
+				break
+			}
+		}
 		if section == nil {
 			t.Fatal("missing section")
 		}
@@ -280,21 +294,19 @@ func (r sparseReader) ReadAt(p []byte, off int64) (int, error) {
 	return len(p), nil
 }
 
-type countingWriter struct{ bytes int64 }
-
-var _ io.Writer = (*countingWriter)(nil)
-
-func (w *countingWriter) Write(p []byte) (int, error) { w.bytes += int64(len(p)); return len(p), nil }
-
 func TestStreamingAndELF32Overflow(t *testing.T) {
 	input := fixture(t, encodings[2], elf.EM_AARCH64, 5, false)
 	const size = 600 * 1024 * 1024
-	var out countingWriter
-	if err := WriteSection(context.Background(), &out, sparseReader{input, size}, size, ".extra", []byte("data"), SectionOptions{}); err != nil {
+	source := sparseReader{input, size}
+	out := streamVerifier{source: source}
+	if err := WriteSection(context.Background(), &out, source, size, ".extra", []byte("data"), SectionOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	if out.bytes <= size || out.bytes > size+4096 {
 		t.Fatalf("unexpected output size %d", out.bytes)
+	}
+	if !bytes.HasPrefix(out.tail.Bytes(), []byte("data")) {
+		t.Fatal("streamed payload differs")
 	}
 	input = fixture(t, encodings[0], elf.EM_ARM, 5, false)
 	var buffer bytes.Buffer

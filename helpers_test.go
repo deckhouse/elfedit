@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"debug/elf"
 	"encoding/binary"
+	"fmt"
+	"io"
 	"testing"
 )
 
@@ -107,4 +109,92 @@ func openELF(t testing.TB, data []byte) *elf.File {
 		}
 	})
 	return f
+}
+
+func assertPreserved(t testing.TB, input, output []byte) {
+	t.Helper()
+	if len(output) < len(input) {
+		t.Fatal("output truncated original file")
+	}
+	for i, b := range input {
+		if elf.Class(input[elf.EI_CLASS]) == elf.ELFCLASS32 {
+			if i >= 32 && i < 36 || i >= 46 && i < 52 {
+				continue
+			}
+		} else if i >= 40 && i < 48 || i >= 58 && i < 64 {
+			continue
+		}
+		if output[i] != b {
+			t.Fatalf("original byte %d changed: %#x -> %#x", i, b, output[i])
+		}
+	}
+}
+
+func putFixtureSection(t testing.TB, enc encoding, input []byte, index int, s elf.Section64) {
+	t.Helper()
+	var out bytes.Buffer
+	var value any = s
+	if enc.class == elf.ELFCLASS32 {
+		value = elf.Section32{Name: s.Name, Type: s.Type, Flags: uint32(s.Flags), Addr: uint32(s.Addr), Off: uint32(s.Off), Size: uint32(s.Size), Link: s.Link, Info: s.Info, Addralign: uint32(s.Addralign), Entsize: uint32(s.Entsize)}
+	}
+	if err := binary.Write(&out, enc.order, value); err != nil {
+		t.Fatal(err)
+	}
+	copy(input[1024+index*out.Len():], out.Bytes())
+}
+
+func sectionTable(t testing.TB, enc encoding, input []byte) (int, int) {
+	t.Helper()
+	if enc.class == elf.ELFCLASS32 {
+		return int(enc.order.Uint32(input[32:36])), int(enc.order.Uint16(input[46:48]))
+	}
+	return int(enc.order.Uint64(input[40:48])), int(enc.order.Uint16(input[58:60]))
+}
+
+type streamVerifier struct {
+	source sparseReader
+	bytes  int64
+	tail   bytes.Buffer
+}
+
+var _ io.Writer = (*streamVerifier)(nil)
+
+func (w *streamVerifier) Write(p []byte) (int, error) {
+	start, end := max(w.bytes, 64), min(w.bytes+int64(len(p)), w.source.size)
+	if start < end {
+		want := make([]byte, end-start)
+		if _, err := w.source.ReadAt(want, start); err != nil {
+			return 0, err
+		}
+		if !bytes.Equal(p[start-w.bytes:end-w.bytes], want) {
+			return 0, fmt.Errorf("streamed source differs at offset %d", start)
+		}
+	}
+	if w.bytes+int64(len(p)) > w.source.size {
+		if _, err := w.tail.Write(p[max(w.source.size-w.bytes, 0):]); err != nil {
+			return 0, err
+		}
+	}
+	w.bytes += int64(len(p))
+	return len(p), nil
+}
+
+type interruptWriter struct {
+	bytes     int
+	after     int
+	interrupt func()
+	err       error
+}
+
+var _ io.Writer = (*interruptWriter)(nil)
+
+func (w *interruptWriter) Write(p []byte) (int, error) {
+	w.bytes += len(p)
+	if w.bytes >= w.after {
+		w.interrupt()
+		if w.err != nil {
+			return 0, w.err
+		}
+	}
+	return len(p), nil
 }

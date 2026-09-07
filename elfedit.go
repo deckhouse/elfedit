@@ -18,6 +18,9 @@ type SectionOptions struct {
 	Type      elf.SectionType
 	Flags     elf.SectionFlag
 	Alignment uint64
+	// MaxOutputSize bounds the complete output, including padding and tables.
+	// Zero means no caller-imposed limit. It is not a metadata memory limit.
+	MaxOutputSize uint64
 }
 
 // SetSection adds or replaces name with opaque data and the supplied metadata.
@@ -67,7 +70,7 @@ func WriteSection(ctx context.Context, dst io.Writer, src io.ReaderAt, size int6
 	}
 	index := -1
 	for i, s := range f.sections {
-		if i == 0 {
+		if s.Type == uint32(elf.SHT_NULL) {
 			continue
 		}
 		end := bytes.IndexByte(f.names[s.Name:], 0)
@@ -94,6 +97,9 @@ func WriteSection(ctx context.Context, dst io.Writer, src io.ReaderAt, size int6
 	limit := uint64(math.MaxInt64)
 	if f.class == elf.ELFCLASS32 {
 		limit = math.MaxUint32
+	}
+	if opts.MaxOutputSize != 0 {
+		limit = min(limit, opts.MaxOutputSize)
 	}
 	offset, end, err := place(uint64(size), uint64(len(data)), opts.Alignment, limit)
 	if err != nil {
@@ -246,6 +252,12 @@ func readFile(ctx context.Context, src io.ReaderAt, size int64) (*file, error) {
 		if zero.Type != uint32(elf.SHT_NULL) {
 			return nil, fmt.Errorf("read ELF: section zero must be SHT_NULL")
 		}
+		if zero.Name != 0 || zero.Flags != 0 || zero.Addr != 0 || zero.Off != 0 || zero.Addralign != 0 || zero.Entsize != 0 {
+			return nil, fmt.Errorf("read ELF: invalid section zero fields")
+		}
+		if shnum != 0 && zero.Size != 0 || shstrndx != uint64(elf.SHN_XINDEX) && zero.Link != 0 || phnum != 0xffff && zero.Info != 0 {
+			return nil, fmt.Errorf("read ELF: unused extended counts in section zero")
+		}
 		if shnum == 0 {
 			shnum = zero.Size
 		}
@@ -280,6 +292,9 @@ func readFile(ctx context.Context, src io.ReaderAt, size int64) (*file, error) {
 		if str.Type != uint32(elf.SHT_STRTAB) || str.Size == 0 || str.Size > math.MaxUint32 || str.Size > uint64(math.MaxInt) {
 			return nil, fmt.Errorf("read ELF: invalid section-name table")
 		}
+		if str.Flags&uint64(elf.SHF_COMPRESSED) != 0 {
+			return nil, fmt.Errorf("read ELF: compressed section-name table is unsupported")
+		}
 		f.names = make([]byte, int(str.Size))
 		if _, err := src.ReadAt(f.names, int64(str.Off)); err != nil {
 			return nil, fmt.Errorf("read section names: %w", err)
@@ -288,7 +303,7 @@ func readFile(ctx context.Context, src io.ReaderAt, size int64) (*file, error) {
 			return nil, fmt.Errorf("read ELF: section names must start and end with NUL")
 		}
 		for i, s := range f.sections {
-			if i != 0 && uint64(s.Name) >= uint64(len(f.names)) {
+			if s.Type != uint32(elf.SHT_NULL) && uint64(s.Name) >= uint64(len(f.names)) {
 				return nil, fmt.Errorf("read ELF: section %d name outside table", i)
 			}
 		}
