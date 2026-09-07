@@ -94,13 +94,27 @@ func TestLinuxExecution(t *testing.T) {
 		t.Fatal(err)
 	}
 	file := openELF(t, input)
-	output, err := SetSection(context.Background(), input, ".note.example", notePayload(file.ByteOrder), SectionOptions{Type: elf.SHT_NOTE, Alignment: 4})
+	payload := notePayload(file.ByteOrder)
+	output, err := SetSection(context.Background(), input, ".note.example", payload, SectionOptions{Type: elf.SHT_NOTE, Alignment: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "true")
 	if err := os.WriteFile(path, output, 0700); err != nil {
 		t.Fatal(err)
+	}
+	written, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPreserved(t, input, written)
+	section := openELF(t, written).Section(".note.example")
+	if section == nil {
+		t.Fatal("written executable has no added section")
+	}
+	data, err := section.Data()
+	if err != nil || !bytes.Equal(data, payload) {
+		t.Fatalf("written section payload=%q err=%v", data, err)
 	}
 	runTool(t, path)
 }
