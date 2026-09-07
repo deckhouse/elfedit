@@ -1,0 +1,28 @@
+version: '3'
+
+tasks:
+  format:
+    cmds:
+      - gofmt -w *.go
+  build:
+    env:
+      CGO_ENABLED: '0'
+    cmds:
+      - go build ./...
+  lint:
+    cmds:
+      - go vet ./...
+  test:
+    cmds:
+      - go test {{.CLI_ARGS}} ./...
+  fuzz:
+    cmds:
+      - go test -run '^$' -fuzz FuzzSetSection -fuzztime '{{.duration | default "20s"}}' -parallel 2
+  test:binutils:
+    env:
+      ELFEDIT_BINUTILS: '1'
+    cmds:
+      - go test -count=1 -v -run TestBinutils ./...
+  test:linux:
+    cmds:
+      - docker run --rm --network=none -v "{{.ROOT_DIR}}:/src:ro" -w /src -e GOTOOLCHAIN=local -e GOCACHE=/tmp/go-cache -e CGO_ENABLED=0 golang:1.25.5-bookworm go test -count=1 -v -run TestLinuxExecution ./...
