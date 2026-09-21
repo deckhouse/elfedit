@@ -79,22 +79,49 @@ func TestReplacementMetadata(t *testing.T) {
 			if err != nil || string(data) != "replaced" {
 				t.Fatalf("replacement payload=%q err=%v", data, err)
 			}
-			// The payload is the same size as the section it replaces, so it is
-			// written where that section already lies and the table is rewritten
-			// in place; every byte outside those two spans is kept.
-			entrySize := 64
-			if enc.class == elf.ELFCLASS32 {
-				entrySize = 40
-			}
-			shoff, _ := sectionTable(t, enc, out)
-			entry := shoff + 4*entrySize
-			rest := bytes.Clone(out)
-			copy(rest[640:648], input[640:648])
-			copy(rest[entry:entry+entrySize], input[entry:entry+entrySize])
-			assertPreserved(t, input, rest)
+			assertSectionEditPreserved(t, input, out, ".extra")
 			if len(out) != len(input) {
 				t.Fatalf("same-sized replacement resized the file: %d -> %d", len(input), len(out))
 			}
+		})
+	}
+}
+
+func TestReplaceInPlaceRejectsOverlaps(t *testing.T) {
+	for _, enc := range encodings {
+		t.Run(enc.name, func(t *testing.T) {
+			t.Run("section", func(t *testing.T) {
+				input := fixture(t, enc, elf.EM_ARM, 6, false)
+				putFixtureSection(t, enc, input, 4, elf.Section64{Name: 22, Type: uint32(elf.SHT_PROGBITS), Off: 640, Size: 8, Addralign: 8})
+				putFixtureSection(t, enc, input, 5, elf.Section64{Type: uint32(elf.SHT_PROGBITS), Off: 644, Size: 4, Addralign: 1})
+
+				out, err := SetSection(context.Background(), input, ".extra", []byte("replaced"), SectionOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertPreserved(t, input, out)
+				if s := openELF(t, out).Section(".extra"); s.Offset < uint64(len(input)) {
+					t.Fatalf("overlapping section was overwritten in place at %d", s.Offset)
+				}
+			})
+
+			t.Run("program headers", func(t *testing.T) {
+				input := fixture(t, enc, elf.EM_ARM, 5, false)
+				headerSize := uint64(64)
+				if enc.class == elf.ELFCLASS32 {
+					headerSize = 52
+				}
+				putFixtureSection(t, enc, input, 4, elf.Section64{Name: 22, Type: uint32(elf.SHT_PROGBITS), Off: headerSize, Size: 8, Addralign: 1})
+
+				out, err := SetSection(context.Background(), input, ".extra", []byte("replaced"), SectionOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertPreserved(t, input, out)
+				if s := openELF(t, out).Section(".extra"); s.Offset < uint64(len(input)) {
+					t.Fatalf("section overlapping program headers was overwritten in place at %d", s.Offset)
+				}
+			})
 		})
 	}
 }

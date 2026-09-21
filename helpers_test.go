@@ -2,6 +2,7 @@ package elfedit
 
 import (
 	"bytes"
+	"context"
 	"debug/elf"
 	"encoding/binary"
 	"fmt"
@@ -128,6 +129,34 @@ func assertPreserved(t testing.TB, input, output []byte) {
 			t.Fatalf("original byte %d changed: %#x -> %#x", i, b, output[i])
 		}
 	}
+}
+
+func assertSectionEditPreserved(t testing.TB, input, output []byte, name string) {
+	t.Helper()
+	if len(output) != len(input) {
+		assertPreserved(t, input, output)
+		return
+	}
+	f, err := readFile(context.Background(), bytes.NewReader(input), int64(len(input)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, s := range f.sections {
+		if s.Type == uint32(elf.SHT_NULL) {
+			continue
+		}
+		end := bytes.IndexByte(f.names[s.Name:], 0)
+		if string(f.names[int(s.Name):int(s.Name)+end]) != name {
+			continue
+		}
+		restored := bytes.Clone(output)
+		copy(restored[s.Off:s.Off+s.Size], input[s.Off:s.Off+s.Size])
+		entry := f.shoff + uint64(i*f.shentsize)
+		copy(restored[entry:entry+uint64(f.shentsize)], input[entry:entry+uint64(f.shentsize)])
+		assertPreserved(t, input, restored)
+		return
+	}
+	t.Fatalf("same-sized edit did not find section %q in input", name)
 }
 
 func putFixtureSection(t testing.TB, enc encoding, input []byte, index int, s elf.Section64) {

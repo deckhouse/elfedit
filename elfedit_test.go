@@ -282,7 +282,7 @@ func FuzzSetSection(f *testing.F) {
 		if err != nil {
 			return
 		}
-		assertPreserved(t, input, out)
+		assertSectionEditPreserved(t, input, out, ".fuzz")
 		// The editor preserves opaque metadata that debug/elf may reject already
 		// in the input (e.g. undefined fields of inactive SHT_NULL entries).
 		before, err := elf.NewFile(bytes.NewReader(input))

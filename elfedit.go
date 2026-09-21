@@ -102,7 +102,7 @@ func WriteSection(ctx context.Context, dst io.Writer, src io.ReaderAt, size int6
 	if opts.MaxOutputSize != 0 {
 		limit = min(limit, opts.MaxOutputSize)
 	}
-	if index >= 0 && uint64(size) <= limit && f.overwritable(f.sections[index], uint64(len(data)), opts.Alignment) {
+	if index >= 0 && uint64(size) <= limit && f.overwritable(index, uint64(len(data)), opts.Alignment) {
 		return f.overwrite(ctx, dst, src, size, index, data, opts)
 	}
 	offset, end, err := place(uint64(size), uint64(len(data)), opts.Alignment, limit)
@@ -175,11 +175,27 @@ func WriteSection(ctx context.Context, dst io.Writer, src io.ReaderAt, size int6
 	return ctx.Err()
 }
 
-// overwritable reports whether data can replace s where it already lies, leaving
-// every other byte of the file, including the section table, where it is.
-func (f *file) overwritable(s elf.Section64, dataSize, alignment uint64) bool {
-	return f.shoff != 0 && s.Size == dataSize && s.Off >= uint64(len(f.header)) &&
-		s.Off%alignment == 0 && s.Off+dataSize <= f.shoff
+// overwritable reports whether data can replace the section at index where it
+// already lies without clobbering another file-backed ELF structure.
+func (f *file) overwritable(index int, dataSize, alignment uint64) bool {
+	s := f.sections[index]
+	if f.shoff == 0 || s.Size != dataSize || s.Off < uint64(len(f.header)) ||
+		s.Off%alignment != 0 || s.Off+dataSize > f.shoff {
+		return false
+	}
+	target := span{offset: s.Off, size: dataSize}
+	if overlaps(target, f.programHeaders) {
+		return false
+	}
+	for i, other := range f.sections {
+		if i == index || other.Type == uint32(elf.SHT_NULL) || other.Type == uint32(elf.SHT_NOBITS) {
+			continue
+		}
+		if overlaps(target, span{offset: other.Off, size: other.Size}) {
+			return false
+		}
+	}
+	return true
 }
 
 // overwrite streams the source with data written over the section at index. The
@@ -223,18 +239,23 @@ func (f *file) overwrite(ctx context.Context, dst io.Writer, src io.ReaderAt, si
 }
 
 type file struct {
-	header    []byte
-	class     elf.Class
-	order     binary.ByteOrder
-	shentsize int
-	shstrndx  int
-	sections  []elf.Section64
-	names     []byte
-	segments  []span
-	shoff     uint64
+	header         []byte
+	class          elf.Class
+	order          binary.ByteOrder
+	shentsize      int
+	shstrndx       int
+	sections       []elf.Section64
+	names          []byte
+	segments       []span
+	programHeaders span
+	shoff          uint64
 }
 
 type span struct{ offset, size uint64 }
+
+func overlaps(a, b span) bool {
+	return a.size != 0 && b.size != 0 && a.offset < b.offset+b.size && b.offset < a.offset+a.size
+}
 
 func readFile(ctx context.Context, src io.ReaderAt, size int64) (*file, error) {
 	if size < 16 {
@@ -367,6 +388,7 @@ func readFile(ctx context.Context, src io.ReaderAt, size int64) (*file, error) {
 	if phoff < uint64(len(f.header)) || int(phentsize) != phsize || phoff > uint64(size) || phnum > (uint64(size)-phoff)/uint64(phsize) {
 		return nil, fmt.Errorf("read ELF: invalid program header table")
 	}
+	f.programHeaders = span{offset: phoff, size: phnum * uint64(phsize)}
 	for i := uint64(0); i < phnum; i++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
