@@ -79,7 +79,22 @@ func TestReplacementMetadata(t *testing.T) {
 			if err != nil || string(data) != "replaced" {
 				t.Fatalf("replacement payload=%q err=%v", data, err)
 			}
-			assertPreserved(t, input, out)
+			// The payload is the same size as the section it replaces, so it is
+			// written where that section already lies and the table is rewritten
+			// in place; every byte outside those two spans is kept.
+			entrySize := 64
+			if enc.class == elf.ELFCLASS32 {
+				entrySize = 40
+			}
+			shoff, _ := sectionTable(t, enc, out)
+			entry := shoff + 4*entrySize
+			rest := bytes.Clone(out)
+			copy(rest[640:648], input[640:648])
+			copy(rest[entry:entry+entrySize], input[entry:entry+entrySize])
+			assertPreserved(t, input, rest)
+			if len(out) != len(input) {
+				t.Fatalf("same-sized replacement resized the file: %d -> %d", len(input), len(out))
+			}
 		})
 	}
 }

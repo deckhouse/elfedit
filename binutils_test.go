@@ -117,6 +117,20 @@ func TestLinuxExecution(t *testing.T) {
 		t.Fatalf("written section payload=%q err=%v", data, err)
 	}
 	runTool(t, path)
+
+	// Replacing the section with same-sized content rewrites it where it already
+	// lies, so the executable must survive the in-place edit too.
+	same, err := SetSection(context.Background(), written, ".note.example", payload, SectionOptions{Type: elf.SHT_NOTE, Alignment: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(same, written) {
+		t.Fatal("replacing a section with identical content changed the file")
+	}
+	if err := os.WriteFile(path, same, 0700); err != nil {
+		t.Fatal(err)
+	}
+	runTool(t, path)
 }
 
 func notePayload(order binary.ByteOrder) []byte {

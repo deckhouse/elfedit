@@ -69,6 +69,43 @@ func TestSetSection(t *testing.T) {
 	}
 }
 
+func TestReplaceInPlace(t *testing.T) {
+	for _, enc := range encodings {
+		t.Run(enc.name, func(t *testing.T) {
+			opts := SectionOptions{Type: elf.SHT_NOTE, Alignment: 4}
+			signed, err := SetSection(context.Background(), fixture(t, enc, elf.EM_X86_64, 5, false), ".note.example", bytes.Repeat([]byte{1}, 13), opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := openELF(t, signed).Section(".note.example")
+			shoff, _ := sectionTable(t, enc, signed)
+			current := signed
+			for round := byte(2); round < 5; round++ {
+				payload := bytes.Repeat([]byte{round}, 13)
+				out, err := SetSection(context.Background(), current, ".note.example", payload, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(out) != len(signed) {
+					t.Fatalf("round %d resized the file: %d -> %d", round, len(signed), len(out))
+				}
+				if off, _ := sectionTable(t, enc, out); off != shoff {
+					t.Fatalf("round %d moved the section table: %d -> %d", round, shoff, off)
+				}
+				section := openELF(t, out).Section(".note.example")
+				if section == nil || section.Offset != before.Offset || section.Size != before.Size {
+					t.Fatalf("round %d moved the section: %+v", round, section)
+				}
+				data, err := section.Data()
+				if err != nil || !bytes.Equal(data, payload) {
+					t.Fatalf("round %d payload=%q err=%v", round, data, err)
+				}
+				current = out
+			}
+		})
+	}
+}
+
 func TestExtendedNumbering(t *testing.T) {
 	for _, enc := range encodings {
 		for _, count := range []int{int(elf.SHN_LORESERVE) - 1, int(elf.SHN_LORESERVE) + 1} {
