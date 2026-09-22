@@ -40,10 +40,10 @@ The caller builds the note envelope in the target ELF byte order. The writer tre
 
 - ELF32 and ELF64, little- and big-endian. `e_machine`, ABI identity and machine flags are preserved without a machine allowlist.
 - Adding a section appends its data, an extended copy of the section-name table, and a new section-header table. Existing section indexes and name offsets remain stable.
-- Replacing a section keeps its index, `sh_link`, `sh_info`, `sh_addr` and `sh_entsize`. Type, flags, alignment, offset and size are supplied by the operation. The name table is not rewritten.
+- Replacing a section keeps its index, `sh_link`, `sh_info`, `sh_addr` and `sh_entsize`. A same-sized replacement whose existing offset satisfies the requested alignment is written in place when it precedes the section-header table and neither it nor that table overlaps another file-backed section or the program-header table. Otherwise its data and a new section-header table are appended. The name table is not rewritten.
 - Extended section counts and string-table indexes use the `SHN_LORESERVE` boundary; extended program counts are read from section zero and preserved.
 - Files without a section table receive a new one. Files with an existing table but no section-name table, or a compressed section-name table, are currently rejected.
-- Program headers and existing section data, gaps and overlays are retained byte for byte. Only section-table fields of the ELF header change. Old tables and old payload bytes remain in the file; repeated replacements grow it. This is not secure erasure.
+- Program headers and unrelated section data, gaps and overlays are retained byte for byte. An in-place replacement changes only its section data and table entry. An appended replacement leaves the old table and payload bytes in the file, so replacements that change size or require stricter alignment still grow it. This is not secure erasure.
 
 This covers the add/update/flags subset of `objcopy` needed to store metadata, not the complete `objcopy` command line. For a signature section, one replacement substitutes for `--remove-section` followed by `--add-section`, without changing other section indexes. There is no deletion, stripping, relocation, allocated-section editing, archive support or binary-format conversion. Output layout is not byte-identical to GNU objcopy's layout.
 
@@ -69,7 +69,7 @@ task test:linux
 
 Unit tests cover ELF32/64 × both byte orders, known and unknown machines, replacement, byte preservation, extended numbering, malformed inputs, streaming a synthetic 600 MiB file, and ELF32 overflow. Output is inspected with Go's independent `debug/elf` reader.
 
-Fuzzing exercises malformed input too and checks byte preservation for every successful edit. Output readability and payload are checked with `debug/elf` when it can read the input; the editor is not a validator for opaque section contents or undefined inactive fields. Deterministic tests separately assert rejection of invalid section-zero fields and preservation of inactive entries.
+Fuzzing exercises malformed input too and checks byte preservation outside the target section and its table entry for every successful edit. Output readability and payload are checked with `debug/elf` when it can read the input; the editor is not a validator for opaque section contents or undefined inactive fields. Deterministic tests separately assert rejection of invalid section-zero fields and preservation of inactive entries.
 
 `test:binutils` requires clang and GNU `objcopy`/`readelf` in PATH. It compiles actual ELF object files for i386, x86_64, ARM LE/BE and AArch64 LE/BE; checks notes with readelf, extracts payloads with objcopy, and updates sections created by objcopy. On macOS, GNU tools can be placed in PATH with `PATH="$(brew --prefix binutils)/bin:$PATH"`.
 

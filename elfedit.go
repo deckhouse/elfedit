@@ -25,7 +25,8 @@ type SectionOptions struct {
 
 // SetSection adds or replaces name with opaque data and the supplied metadata.
 // Replacing a section preserves its index, Link, Info, Addr and Entsize. Existing
-// source bytes are retained except for the ELF header's section-table fields.
+// source bytes are retained except for the ELF header's section-table fields and,
+// when the replacement fits the section it overwrites, that section's own bytes.
 func SetSection(ctx context.Context, image []byte, name string, data []byte, opts SectionOptions) ([]byte, error) {
 	var out bytes.Buffer
 	if err := WriteSection(ctx, &out, bytes.NewReader(image), int64(len(image)), name, data, opts); err != nil {
@@ -101,6 +102,9 @@ func WriteSection(ctx context.Context, dst io.Writer, src io.ReaderAt, size int6
 	if opts.MaxOutputSize != 0 {
 		limit = min(limit, opts.MaxOutputSize)
 	}
+	if index >= 0 && uint64(size) <= limit && f.overwritable(index, uint64(len(data)), opts.Alignment) {
+		return f.overwrite(ctx, dst, src, size, index, data, opts)
+	}
 	offset, end, err := place(uint64(size), uint64(len(data)), opts.Alignment, limit)
 	if err != nil {
 		return err
@@ -171,18 +175,97 @@ func WriteSection(ctx context.Context, dst io.Writer, src io.ReaderAt, size int6
 	return ctx.Err()
 }
 
+// overwritable reports whether data can replace the section at index where it
+// already lies without clobbering another file-backed ELF structure. Both the
+// section data and the table entry describing it are rewritten, so the table
+// has to be disjoint from everything else as well. A section stored past the
+// table keeps the appending path: the writer emits the file in offset order.
+func (f *file) overwritable(index int, dataSize, alignment uint64) bool {
+	s := f.sections[index]
+	if f.shoff == 0 || s.Size != dataSize || s.Off < uint64(len(f.header)) ||
+		s.Off%alignment != 0 || s.Off+dataSize > f.shoff {
+		return false
+	}
+	target := span{offset: s.Off, size: dataSize}
+	table := span{offset: f.shoff, size: uint64(len(f.sections)) * uint64(f.shentsize)}
+	if overlaps(target, f.programHeaders) || overlaps(table, f.programHeaders) {
+		return false
+	}
+	for _, p := range f.segments {
+		if overlaps(table, p) {
+			return false
+		}
+	}
+	for i, other := range f.sections {
+		if i == index || other.Type == uint32(elf.SHT_NULL) || other.Type == uint32(elf.SHT_NOBITS) {
+			continue
+		}
+		otherSpan := span{offset: other.Off, size: other.Size}
+		if overlaps(target, otherSpan) || overlaps(table, otherSpan) {
+			return false
+		}
+	}
+	return true
+}
+
+// overwrite streams the source with data written over the section at index. The
+// output is the same size as the input, so repeatedly replacing a section with
+// same-sized content does not grow the file.
+func (f *file) overwrite(ctx context.Context, dst io.Writer, src io.ReaderAt, size int64, index int, data []byte, opts SectionOptions) error {
+	s := &f.sections[index]
+	s.Type, s.Flags, s.Addralign = uint32(opts.Type), uint64(opts.Flags), opts.Alignment
+	table, err := f.encodeTable(f.shoff)
+	if err != nil {
+		return err
+	}
+	if uint64(len(table)) > uint64(size)-f.shoff {
+		return fmt.Errorf("edit ELF: section table outside file")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := writeAll(dst, f.header); err != nil {
+		return fmt.Errorf("write ELF header: %w", err)
+	}
+	copyRange := func(from, to uint64) error {
+		return copyBytes(ctx, dst, io.NewSectionReader(src, int64(from), int64(to-from)), int64(to-from))
+	}
+	if err := copyRange(uint64(len(f.header)), s.Off); err != nil {
+		return fmt.Errorf("copy ELF body: %w", err)
+	}
+	if err := writeAll(dst, data); err != nil {
+		return fmt.Errorf("write section data: %w", err)
+	}
+	if err := copyRange(s.Off+uint64(len(data)), f.shoff); err != nil {
+		return fmt.Errorf("copy ELF body: %w", err)
+	}
+	if err := writeAll(dst, table); err != nil {
+		return fmt.Errorf("write section headers: %w", err)
+	}
+	if err := copyRange(f.shoff+uint64(len(table)), uint64(size)); err != nil {
+		return fmt.Errorf("copy ELF body: %w", err)
+	}
+	return ctx.Err()
+}
+
 type file struct {
-	header    []byte
-	class     elf.Class
-	order     binary.ByteOrder
-	shentsize int
-	shstrndx  int
-	sections  []elf.Section64
-	names     []byte
-	segments  []span
+	header         []byte
+	class          elf.Class
+	order          binary.ByteOrder
+	shentsize      int
+	shstrndx       int
+	sections       []elf.Section64
+	names          []byte
+	segments       []span
+	programHeaders span
+	shoff          uint64
 }
 
 type span struct{ offset, size uint64 }
+
+func overlaps(a, b span) bool {
+	return a.size != 0 && b.size != 0 && a.offset < b.offset+b.size && b.offset < a.offset+a.size
+}
 
 func readFile(ctx context.Context, src io.ReaderAt, size int64) (*file, error) {
 	if size < 16 {
@@ -274,6 +357,7 @@ func readFile(ctx context.Context, src io.ReaderAt, size int64) (*file, error) {
 			return nil, fmt.Errorf("read ELF: missing or invalid section-name table")
 		}
 		f.shstrndx = int(shstrndx)
+		f.shoff = shoff
 		f.sections = make([]elf.Section64, int(shnum))
 		for i := range f.sections {
 			if err := ctx.Err(); err != nil {
@@ -314,6 +398,7 @@ func readFile(ctx context.Context, src io.ReaderAt, size int64) (*file, error) {
 	if phoff < uint64(len(f.header)) || int(phentsize) != phsize || phoff > uint64(size) || phnum > (uint64(size)-phoff)/uint64(phsize) {
 		return nil, fmt.Errorf("read ELF: invalid program header table")
 	}
+	f.programHeaders = span{offset: phoff, size: phnum * uint64(phsize)}
 	for i := uint64(0); i < phnum; i++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err

@@ -79,7 +79,93 @@ func TestReplacementMetadata(t *testing.T) {
 			if err != nil || string(data) != "replaced" {
 				t.Fatalf("replacement payload=%q err=%v", data, err)
 			}
-			assertPreserved(t, input, out)
+			assertSectionEditPreserved(t, input, out, ".extra")
+			if len(out) != len(input) {
+				t.Fatalf("same-sized replacement resized the file: %d -> %d", len(input), len(out))
+			}
+		})
+	}
+}
+
+func TestReplaceInPlaceRejectsOverlaps(t *testing.T) {
+	for _, enc := range encodings {
+		t.Run(enc.name, func(t *testing.T) {
+			t.Run("section", func(t *testing.T) {
+				input := fixture(t, enc, elf.EM_ARM, 6, false)
+				putFixtureSection(t, enc, input, 4, elf.Section64{Name: 22, Type: uint32(elf.SHT_PROGBITS), Off: 640, Size: 8, Addralign: 8})
+				putFixtureSection(t, enc, input, 5, elf.Section64{Type: uint32(elf.SHT_PROGBITS), Off: 644, Size: 4, Addralign: 1})
+
+				out, err := SetSection(context.Background(), input, ".extra", []byte("replaced"), SectionOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertPreserved(t, input, out)
+				if s := openELF(t, out).Section(".extra"); s.Offset < uint64(len(input)) {
+					t.Fatalf("overlapping section was overwritten in place at %d", s.Offset)
+				}
+			})
+
+			t.Run("section table", func(t *testing.T) {
+				input := fixture(t, enc, elf.EM_ARM, 6, false)
+				putFixtureSection(t, enc, input, 4, elf.Section64{Name: 22, Type: uint32(elf.SHT_PROGBITS), Off: 640, Size: 8, Addralign: 8})
+				putFixtureSection(t, enc, input, 5, elf.Section64{Type: uint32(elf.SHT_PROGBITS), Off: 1024, Size: 8, Addralign: 1})
+
+				out, err := SetSection(context.Background(), input, ".extra", []byte("replaced"), SectionOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertPreserved(t, input, out)
+				if s := openELF(t, out).Section(".extra"); s.Offset < uint64(len(input)) {
+					t.Fatalf("section sharing the table was overwritten in place at %d", s.Offset)
+				}
+			})
+
+			t.Run("table inside a segment", func(t *testing.T) {
+				input := fixture(t, enc, elf.EM_ARM, 5, false)
+				putFixtureSection(t, enc, input, 4, elf.Section64{Name: 22, Type: uint32(elf.SHT_PROGBITS), Off: 640, Size: 8, Addralign: 8})
+				putFixtureSegment(t, enc, input, 1024, 64)
+
+				out, err := SetSection(context.Background(), input, ".extra", []byte("replaced"), SectionOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertPreserved(t, input, out)
+				if s := openELF(t, out).Section(".extra"); s.Offset < uint64(len(input)) {
+					t.Fatalf("section whose table lies in a segment was overwritten in place at %d", s.Offset)
+				}
+			})
+
+			t.Run("ELF header", func(t *testing.T) {
+				input := fixture(t, enc, elf.EM_ARM, 5, false)
+				putFixtureSection(t, enc, input, 4, elf.Section64{Name: 22, Type: uint32(elf.SHT_PROGBITS), Off: 8, Size: 8, Addralign: 1})
+
+				out, err := SetSection(context.Background(), input, ".extra", []byte("replaced"), SectionOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertPreserved(t, input, out)
+				if s := openELF(t, out).Section(".extra"); s.Offset < uint64(len(input)) {
+					t.Fatalf("section inside the ELF header was overwritten in place at %d", s.Offset)
+				}
+			})
+
+			t.Run("program headers", func(t *testing.T) {
+				input := fixture(t, enc, elf.EM_ARM, 5, false)
+				headerSize := uint64(64)
+				if enc.class == elf.ELFCLASS32 {
+					headerSize = 52
+				}
+				putFixtureSection(t, enc, input, 4, elf.Section64{Name: 22, Type: uint32(elf.SHT_PROGBITS), Off: headerSize, Size: 8, Addralign: 1})
+
+				out, err := SetSection(context.Background(), input, ".extra", []byte("replaced"), SectionOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertPreserved(t, input, out)
+				if s := openELF(t, out).Section(".extra"); s.Offset < uint64(len(input)) {
+					t.Fatalf("section overlapping program headers was overwritten in place at %d", s.Offset)
+				}
+			})
 		})
 	}
 }
