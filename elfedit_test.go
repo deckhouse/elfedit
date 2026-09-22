@@ -96,10 +96,14 @@ func TestReplaceInPlace(t *testing.T) {
 				if section == nil || section.Offset != before.Offset || section.Size != before.Size {
 					t.Fatalf("round %d moved the section: %+v", round, section)
 				}
+				if section.Type != opts.Type || section.Flags != opts.Flags || section.Addralign != opts.Alignment {
+					t.Fatalf("round %d lost requested metadata: %+v", round, section.SectionHeader)
+				}
 				data, err := section.Data()
 				if err != nil || !bytes.Equal(data, payload) {
 					t.Fatalf("round %d payload=%q err=%v", round, data, err)
 				}
+				assertSectionEditPreserved(t, current, out, ".note.example")
 				current = out
 			}
 		})

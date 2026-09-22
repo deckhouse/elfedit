@@ -191,6 +191,11 @@ func (f *file) overwritable(index int, dataSize, alignment uint64) bool {
 	if overlaps(target, f.programHeaders) || overlaps(table, f.programHeaders) {
 		return false
 	}
+	for _, p := range f.segments {
+		if overlaps(table, p) {
+			return false
+		}
+	}
 	for i, other := range f.sections {
 		if i == index || other.Type == uint32(elf.SHT_NULL) || other.Type == uint32(elf.SHT_NOBITS) {
 			continue

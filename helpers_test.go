@@ -141,6 +141,11 @@ func assertSectionEditPreserved(t testing.TB, input, output []byte, name string)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// An in-place edit leaves the table where it is, so unlike after an append
+	// the header fields naming it keep their bytes.
+	if !bytes.Equal(output[:len(f.header)], input[:len(f.header)]) {
+		t.Fatal("same-sized edit changed the ELF header")
+	}
 	for i, s := range f.sections {
 		if s.Type == uint32(elf.SHT_NULL) {
 			continue
@@ -157,6 +162,21 @@ func assertSectionEditPreserved(t testing.TB, input, output []byte, name string)
 		return
 	}
 	t.Fatalf("same-sized edit did not find section %q in input", name)
+}
+
+func putFixtureSegment(t testing.TB, enc encoding, input []byte, offset, size uint64) {
+	t.Helper()
+	var out bytes.Buffer
+	var value any = elf.Prog64{Type: uint32(elf.PT_LOAD), Flags: uint32(elf.PF_R), Off: offset, Vaddr: 0x30000, Filesz: size, Memsz: size, Align: 1}
+	headerSize := 64
+	if enc.class == elf.ELFCLASS32 {
+		value = elf.Prog32{Type: uint32(elf.PT_LOAD), Flags: uint32(elf.PF_R), Off: uint32(offset), Vaddr: 0x30000, Filesz: uint32(size), Memsz: uint32(size), Align: 1}
+		headerSize = 52
+	}
+	if err := binary.Write(&out, enc.order, value); err != nil {
+		t.Fatal(err)
+	}
+	copy(input[headerSize:], out.Bytes())
 }
 
 func putFixtureSection(t testing.TB, enc encoding, input []byte, index int, s elf.Section64) {
