@@ -176,7 +176,10 @@ func WriteSection(ctx context.Context, dst io.Writer, src io.ReaderAt, size int6
 }
 
 // overwritable reports whether data can replace the section at index where it
-// already lies without clobbering another file-backed ELF structure.
+// already lies without clobbering another file-backed ELF structure. Both the
+// section data and the table entry describing it are rewritten, so the table
+// has to be disjoint from everything else as well. A section stored past the
+// table keeps the appending path: the writer emits the file in offset order.
 func (f *file) overwritable(index int, dataSize, alignment uint64) bool {
 	s := f.sections[index]
 	if f.shoff == 0 || s.Size != dataSize || s.Off < uint64(len(f.header)) ||
@@ -184,14 +187,16 @@ func (f *file) overwritable(index int, dataSize, alignment uint64) bool {
 		return false
 	}
 	target := span{offset: s.Off, size: dataSize}
-	if overlaps(target, f.programHeaders) {
+	table := span{offset: f.shoff, size: uint64(len(f.sections)) * uint64(f.shentsize)}
+	if overlaps(target, f.programHeaders) || overlaps(table, f.programHeaders) {
 		return false
 	}
 	for i, other := range f.sections {
 		if i == index || other.Type == uint32(elf.SHT_NULL) || other.Type == uint32(elf.SHT_NOBITS) {
 			continue
 		}
-		if overlaps(target, span{offset: other.Off, size: other.Size}) {
+		otherSpan := span{offset: other.Off, size: other.Size}
+		if overlaps(target, otherSpan) || overlaps(table, otherSpan) {
 			return false
 		}
 	}
