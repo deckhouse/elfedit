@@ -247,3 +247,40 @@ func (w *interruptWriter) Write(p []byte) (int, error) {
 	}
 	return len(p), nil
 }
+
+func sharedNamesFixture(t testing.TB, enc encoding, count int) []byte {
+	t.Helper()
+	input := fixture(t, enc, elf.EM_X86_64, count, false)
+	names := []byte("\x00.shstrtab\x00.text\x00.bss\x00.extra\x00.strtab\x00.symtab\x00symbol\x00")
+	copy(input[256:], names)
+	putFixtureSection(t, enc, input, 1, elf.Section64{Name: 29, Type: uint32(elf.SHT_STRTAB), Off: 256, Size: uint64(len(names)), Addralign: 1})
+	var symbols bytes.Buffer
+	var zero, symbol any = elf.Sym64{}, elf.Sym64{Name: 45, Info: 0x12, Shndx: 2, Value: 0x10200, Size: 4}
+	if enc.class == elf.ELFCLASS32 {
+		zero, symbol = elf.Sym32{}, elf.Sym32{Name: 45, Info: 0x12, Shndx: 2, Value: 0x10200, Size: 4}
+	}
+	for _, s := range []any{zero, symbol} {
+		if err := binary.Write(&symbols, enc.order, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	copy(input[768:], symbols.Bytes())
+	putFixtureSection(t, enc, input, 4, elf.Section64{Name: 37, Type: uint32(elf.SHT_SYMTAB), Off: 768, Size: uint64(symbols.Len()), Link: 1, Info: 1, Addralign: 8, Entsize: uint64(binary.Size(symbol))})
+	return input
+}
+
+func assertOriginalSections(t testing.TB, enc encoding, input, output []byte) {
+	t.Helper()
+	before, after := openELF(t, input), openELF(t, output)
+	oldTable, entrySize := sectionTable(t, enc, input)
+	newTable, _ := sectionTable(t, enc, output)
+	for i := 1; i < len(before.Sections); i++ {
+		if !bytes.Equal(input[oldTable+i*entrySize:oldTable+(i+1)*entrySize], output[newTable+i*entrySize:newTable+(i+1)*entrySize]) {
+			t.Fatalf("original section %d header changed", i)
+		}
+		if before.Sections[i].Name != after.Sections[i].Name {
+			t.Fatalf("original section %d name changed", i)
+		}
+	}
+	assertPreserved(t, input, output)
+}

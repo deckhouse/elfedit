@@ -275,6 +275,7 @@ func TestIOAndCancellation(t *testing.T) {
 func FuzzSetSection(f *testing.F) {
 	for _, enc := range encodings {
 		f.Add(fixture(f, enc, elf.EM_ARM, 5, false))
+		f.Add(sharedNamesFixture(f, enc, 5))
 		inactive := fixture(f, enc, elf.EM_ARM, 5, false)
 		copy(inactive[256+22:], []byte(".fuzz\x00"))
 		putFixtureSection(f, enc, inactive, 4, elf.Section64{Name: 22})
@@ -282,34 +283,36 @@ func FuzzSetSection(f *testing.F) {
 	}
 	f.Add([]byte("not ELF"))
 	f.Fuzz(func(t *testing.T, input []byte) {
-		out, err := SetSection(context.Background(), input, ".fuzz", []byte("data"), SectionOptions{MaxOutputSize: uint64(len(input)) + 1<<20})
-		if err != nil {
-			return
-		}
-		assertSectionEditPreserved(t, input, out, ".fuzz")
-		// The editor preserves opaque metadata that debug/elf may reject already
-		// in the input (e.g. undefined fields of inactive SHT_NULL entries).
-		before, err := elf.NewFile(bytes.NewReader(input))
-		if err != nil {
-			return
-		}
-		if err := before.Close(); err != nil {
-			t.Fatal(err)
-		}
-		file := openELF(t, out)
-		var section *elf.Section
-		for _, candidate := range file.Sections {
-			if candidate.Type != elf.SHT_NULL && candidate.Name == ".fuzz" {
-				section = candidate
-				break
+		for _, preserve := range []bool{false, true} {
+			out, err := SetSection(context.Background(), input, ".fuzz", []byte("data"), SectionOptions{MaxOutputSize: uint64(len(input)) + 1<<20, PreserveSectionNameTable: preserve})
+			if err != nil {
+				continue
 			}
-		}
-		if section == nil {
-			t.Fatal("missing section")
-		}
-		data, err := section.Data()
-		if err != nil || string(data) != "data" {
-			t.Fatalf("payload=%q err=%v", data, err)
+			assertSectionEditPreserved(t, input, out, ".fuzz")
+			// The editor preserves opaque metadata that debug/elf may reject already
+			// in the input (e.g. undefined fields of inactive SHT_NULL entries).
+			before, err := elf.NewFile(bytes.NewReader(input))
+			if err != nil {
+				continue
+			}
+			if err := before.Close(); err != nil {
+				t.Fatal(err)
+			}
+			file := openELF(t, out)
+			var section *elf.Section
+			for _, candidate := range file.Sections {
+				if candidate.Type != elf.SHT_NULL && candidate.Name == ".fuzz" {
+					section = candidate
+					break
+				}
+			}
+			if section == nil {
+				t.Fatal("missing section")
+			}
+			data, err := section.Data()
+			if err != nil || string(data) != "data" {
+				t.Fatalf("payload=%q err=%v", data, err)
+			}
 		}
 	})
 }
