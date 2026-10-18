@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"debug/elf"
+	"encoding/binary"
 	"errors"
+	"fmt"
+	"io"
 	"math"
 	"reflect"
 	"testing"
@@ -193,6 +196,143 @@ func TestPreserveNameTableBoundaries(t *testing.T) {
 				if err == nil || dst.Len() != 0 {
 					t.Fatal("ELF32 overflow wrote output")
 				}
+			}
+		})
+	}
+}
+
+func TestExactAndSuffixNames(t *testing.T) {
+	for _, enc := range encodings {
+		t.Run(enc.name, func(t *testing.T) {
+			input := fixture(t, enc, elf.EM_ARM, 5, false)
+			names := []byte("\x00.shstrtab\x00.audit.more\x00prefix.audit\x00")
+			copy(input[256:], names)
+			putFixtureSection(t, enc, input, 1, elf.Section64{Name: 1, Type: uint32(elf.SHT_STRTAB), Off: 256, Size: uint64(len(names)), Addralign: 1})
+			putFixtureSection(t, enc, input, 2, elf.Section64{Name: 11, Type: uint32(elf.SHT_PROGBITS), Flags: uint64(elf.SHF_ALLOC), Off: 512, Size: 4, Addralign: 4})
+			suffix := uint32(bytes.Index(names, []byte("prefix.audit")) + len("prefix"))
+			putFixtureSection(t, enc, input, 3, elf.Section64{Type: uint32(elf.SHT_NULL)})
+			putFixtureSection(t, enc, input, 4, elf.Section64{Name: suffix, Type: uint32(elf.SHT_PROGBITS), Off: 640, Size: 8, Addralign: 1})
+			out, err := SetSection(context.Background(), input, ".audit", []byte("replaced"), SectionOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			f := openELF(t, out)
+			if len(f.Sections) != 5 || f.Sections[4].Name != ".audit" {
+				t.Fatal("suffix target was not replaced")
+			}
+			got, err := f.Sections[4].Data()
+			if err != nil || !bytes.Equal(got, []byte("replaced")) {
+				t.Fatalf("payload=%q err=%v", got, err)
+			}
+			assertSectionEditPreserved(t, input, out, ".audit")
+		})
+	}
+}
+
+func BenchmarkRepeatedNames(b *testing.B) {
+	for _, count := range []int{8192, 32768} {
+		for _, nameSize := range []int{1 << 20, 4 << 20} {
+			b.Run(fmt.Sprintf("sections=%d/nameBytes=%d", count, nameSize), func(b *testing.B) {
+				input := fixture(b, encodings[2], elf.EM_X86_64, count, false)
+				binary.LittleEndian.PutUint16(input[56:58], 0)
+				namesOffset := len(input)
+				names := append([]byte("\x00.shstrtab\x00"), bytes.Repeat([]byte{'x'}, nameSize)...)
+				names = append(names, 0)
+				input = append(input, names...)
+				putFixtureSection(b, encodings[2], input, 1, elf.Section64{Name: 1, Type: uint32(elf.SHT_STRTAB), Off: uint64(namesOffset), Size: uint64(len(names)), Addralign: 1})
+				for i := 2; i < count; i++ {
+					putFixtureSection(b, encodings[2], input, i, elf.Section64{Name: 11, Type: uint32(elf.SHT_PROGBITS)})
+				}
+				b.ResetTimer()
+				for n := 0; n < b.N; n++ {
+					if err := WriteSection(context.Background(), io.Discard, bytes.NewReader(input), int64(len(input)), ".audit", nil, SectionOptions{}); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestEmptySectionNames(t *testing.T) {
+	for _, enc := range encodings {
+		t.Run(enc.name, func(t *testing.T) {
+			input := fixture(t, enc, elf.EM_ARM, 5, false)
+			before, err := readFile(context.Background(), bytes.NewReader(input), int64(len(input)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i, s := range before.sections {
+				s.Name = 0
+				if i == before.shstrndx {
+					s.Size = 0
+					s.Off = uint64(len(input))
+				}
+				before.sections[i] = s
+				putFixtureSection(t, enc, input, i, s)
+			}
+			for _, preserve := range []bool{false, true} {
+				out, err := SetSection(context.Background(), input, ".audit", []byte("data"), SectionOptions{PreserveSectionNameTable: preserve})
+				if err != nil {
+					t.Errorf("preserve=%v: %v", preserve, err)
+					continue
+				}
+				assertPreserved(t, input, out)
+				var streamed bytes.Buffer
+				if err := WriteSection(context.Background(), &streamed, nonemptyReader{bytes.NewReader(input)}, int64(len(input)), ".audit", []byte("data"), SectionOptions{PreserveSectionNameTable: preserve}); err != nil || !bytes.Equal(streamed.Bytes(), out) {
+					t.Fatalf("streamed empty names: %v", err)
+				}
+				after, err := readFile(context.Background(), bytes.NewReader(out), int64(len(out)))
+				if err != nil {
+					t.Fatal("unreadable output:", err)
+				}
+				for i, s := range before.sections {
+					if after.sections[i].Name != 0 {
+						t.Fatalf("section %d numeric name changed", i)
+					}
+					if (preserve || i != before.shstrndx) && after.sections[i] != s {
+						t.Fatalf("preserve=%v: section %d metadata changed", preserve, i)
+					}
+				}
+				newSection := after.sections[len(before.sections)]
+				if newSection.Name != 1 {
+					t.Fatalf("new name index=%d, want 1 (zero remains unnamed)", newSection.Name)
+				}
+				got, err := openELF(t, out).Section(".audit").Data()
+				if err != nil || !bytes.Equal(got, []byte("data")) {
+					t.Fatalf("payload=%q err=%v", got, err)
+				}
+			}
+			invalid := bytes.Clone(input)
+			s := before.sections[2]
+			s.Name = 1
+			putFixtureSection(t, enc, invalid, 2, s)
+			var dst bytes.Buffer
+			if err := WriteSection(context.Background(), &dst, bytes.NewReader(invalid), int64(len(invalid)), ".audit", nil, SectionOptions{}); err == nil || dst.Len() != 0 {
+				t.Fatal("accepted nonzero name in empty table")
+			}
+		})
+	}
+}
+
+func TestCancellationDuringNameLookup(t *testing.T) {
+	for _, enc := range encodings {
+		t.Run(enc.name, func(t *testing.T) {
+			input := fixture(t, enc, elf.EM_ARM, 6, false)
+			if enc.class == elf.ELFCLASS32 {
+				enc.order.PutUint16(input[44:46], 0)
+			} else {
+				enc.order.PutUint16(input[56:58], 0)
+			}
+			for _, i := range []int{4, 5} {
+				putFixtureSection(t, enc, input, i, elf.Section64{Name: 22, Type: uint32(elf.SHT_PROGBITS), Off: 640})
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var out bytes.Buffer
+			err := WriteSection(ctx, &out, cancelOnRead{bytes.NewReader(input), 256, cancel}, int64(len(input)), ".extra", nil, SectionOptions{})
+			if !errors.Is(err, context.Canceled) || out.Len() != 0 {
+				t.Fatalf("cancellation during lookup: err=%v output=%d", err, out.Len())
 			}
 		})
 	}

@@ -36,19 +36,47 @@ err := elfedit.WriteSection(ctx, dst, src, sourceSize, ".note.example", noteByte
 
 The caller builds the note envelope in the target ELF byte order. The writer treats section contents as opaque bytes: type-specific encoding belongs to the caller. For `SHF_COMPRESSED`, supply the compression header and compressed stream, not uncompressed bytes; the editor neither compresses nor decompresses payloads. Hashing, signature bundles, key access, certificate policy and verification belong to consumers such as `delivery-kit-sdk`, not this module.
 
+## Creation metadata restrictions
+
+Creating a section now rejects requests whose required header fields cannot be
+supplied through `SectionOptions`:
+
+| New-section request | Required metadata not expressible by this API |
+| --- | --- |
+| `SHF_MERGE` or `SHF_STRINGS` | `sh_entsize`: element or character size |
+| `SHT_SYMTAB`, `SHT_DYNSYM`, `SHT_GROUP` | `sh_entsize`, `sh_link`, `sh_info` |
+| `SHT_REL`, `SHT_RELA`, `SHT_DYNAMIC`, `SHT_SYMTAB_SHNDX` | `sh_entsize`, `sh_link` (relocations also have type-specific `sh_info`) |
+| `SHT_HASH` | `sh_link` to its symbol table |
+| `SHT_RELR` (19) | `sh_entsize` for relative-relocation entries |
+
+These errors occur before output. This narrows previously accepted creation
+requests, which could emit incomplete headers; it is a behavior change.
+Existing structured and merge/string sections remain replaceable with their
+`sh_link`, `sh_info` and `sh_entsize` retained. Ordinary notes and opaque
+OS/processor/application section types are not subject to a type whitelist.
+
+Supplied flags still replace old flags exactly, including `SHF_GROUP`. The
+editor does not enforce cross-section group consistency or prevent staged edits:
+a caller may add a group member and then update an existing group's opaque
+payload. Creating a fresh `SHT_GROUP` is different: its required header metadata
+is unavailable. Callers remain responsible for consistent final relationships.
+
+See [gABI sections](https://gabi.xinuos.com/elf/03-sheader.html), §§3.2–3.5 and 3.9,
+and [relative relocations](https://gabi.xinuos.com/elf/06-reloc.html#relative-relocation-table).
+
 ## Scope
 
 - ELF32 and ELF64, little- and big-endian. `e_machine`, ABI identity and machine flags are preserved without a machine allowlist.
 - Adding a section appends its data, an extended copy of the section-name table, and a new section-header table. Existing section indexes and name offsets remain stable.
 - `SectionOptions.PreserveSectionNameTable` keeps the original name-table entry and payload unchanged, appending a new nonallocated `.shstrtab` with alignment 1 and selecting it through `e_shstrndx`. Original names remain an unchanged prefix, including when the original table is canonical, shared with symbols, allocated or mapped. Existing unrelated `.shstrtab` sections remain untouched: opting in can produce duplicate names, making subsequent name-based replacement ambiguous. An absent target named `.shstrtab` is rejected with this option. Replacements and files without an original section table retain default behavior. The default is false.
-- Replacing a section keeps its index, `sh_link`, `sh_info`, `sh_addr` and `sh_entsize`. A same-sized replacement whose existing offset satisfies the requested alignment is written in place when it precedes the section-header table and neither it nor that table overlaps another file-backed section or the program-header table. Otherwise its data and a new section-header table are appended. The name table is not rewritten.
+- Replacing a section keeps its index, `sh_link`, `sh_info`, `sh_addr` and `sh_entsize`. A same-sized replacement whose existing offset satisfies the requested alignment is written in place when it precedes the section-header table and neither it nor that table overlaps another file-backed section or the program-header table, and the section-header table does not overlap program-segment data. Otherwise its data and a new section-header table are appended. The name table is not rewritten.
 - Extended section counts and string-table indexes use the `SHN_LORESERVE` boundary; extended program counts are read from section zero and preserved.
-- Files without a section table receive a new one. Files with an existing table but no section-name table, or a compressed section-name table, are currently rejected.
+- Files without a section table receive a new one. Files with an existing table but no section-name table, or a compressed section-name table, are currently rejected. An empty selected string table is supported when all active section-name indexes are zero; newly generated names begin with NUL.
 - Program headers and unrelated section data, gaps and overlays are retained byte for byte. An in-place replacement changes only its section data and table entry. An appended replacement leaves the old table and payload bytes in the file, so replacements that change size or require stricter alignment still grow it. This is not secure erasure.
 
 This covers the add/update/flags subset of `objcopy` needed to store metadata, not the complete `objcopy` command line. For a signature section, one replacement substitutes for `--remove-section` followed by `--add-section`, without changing other section indexes. There is no deletion, stripping, relocation, allocated-section editing, archive support or binary-format conversion. Output layout is not byte-identical to GNU objcopy's layout.
 
-Allocated sections, sections overlapping a program segment, direct replacement of the section-name table, duplicate target names, invalid file-backed ranges and arithmetic overflow are rejected. Section zero's required zero fields are validated; extended counts are preserved. Other `SHT_NULL` entries are inactive: their undefined fields are retained but ignored for name lookup and file ranges. `SHT_NOBITS` offsets describe conceptual placement, not file data. Moving mapped data requires adjusting loader semantics and is intentionally outside this API.
+Allocated sections, sections overlapping a program segment, direct replacement of the section-name table, duplicate target names, invalid file-backed ranges and arithmetic overflow are rejected. Section zero's required zero fields are validated; extended counts are preserved. Other `SHT_NULL` entries are inactive: their undefined fields are retained but ignored for name lookup and file ranges. `PT_NULL` entries are retained but their undefined segment ranges are ignored; the physical program-header table remains protected. `SHT_NOBITS` offsets describe conceptual placement, not file data. Moving mapped data requires adjusting loader semantics and is intentionally outside this API.
 
 `WriteSection` requires a stable source and a distinct destination. Validation precedes output, but I/O failures or cancellation can leave partial output: write a temporary file and finalize it only on success. File permissions and atomic replacement belong to the caller. There is no 512 MiB artifact limit; metadata, names and the new payload still occupy memory.
 
@@ -70,7 +98,7 @@ task test:linux
 
 Unit tests cover ELF32/64 × both byte orders, known and unknown machines, replacement, byte preservation, extended numbering, malformed inputs, streaming a synthetic 600 MiB file, and ELF32 overflow. Output is inspected with Go's independent `debug/elf` reader.
 
-Fuzzing exercises malformed input too and checks byte preservation outside the target section and its table entry for every successful edit. Output readability and payload are checked with `debug/elf` when it can read the input; the editor is not a validator for opaque section contents or undefined inactive fields. Deterministic tests separately assert rejection of invalid section-zero fields and preservation of inactive entries.
+Fuzzing exercises malformed input too and checks byte preservation outside the target section and its table entry, plus active section metadata and numeric name offsets, for every successful edit. Output readability and payload are checked with `debug/elf` when it can read the input; the editor is not a validator for opaque section contents or undefined inactive fields. Deterministic tests separately assert rejection of invalid section-zero fields and preservation of inactive entries.
 
 `test:binutils` requires clang and GNU `objcopy`/`readelf` in PATH. It compiles actual ELF object files for i386, x86_64, ARM LE/BE and AArch64 LE/BE; checks notes with readelf, extracts payloads with objcopy, and updates sections created by objcopy. On macOS, GNU tools can be placed in PATH with `PATH="$(brew --prefix binutils)/bin:$PATH"`.
 

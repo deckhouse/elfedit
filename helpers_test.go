@@ -284,3 +284,84 @@ func assertOriginalSections(t testing.TB, enc encoding, input, output []byte) {
 	}
 	assertPreserved(t, input, output)
 }
+
+type nonemptyReader struct{ *bytes.Reader }
+
+func (r nonemptyReader) ReadAt(p []byte, off int64) (int, error) {
+	if len(p) == 0 {
+		return 0, fmt.Errorf("unexpected zero-length ReadAt")
+	}
+	return r.Reader.ReadAt(p, off)
+}
+
+type cancelOnRead struct {
+	*bytes.Reader
+	offset int64
+	cancel context.CancelFunc
+}
+
+func (r cancelOnRead) ReadAt(p []byte, off int64) (int, error) {
+	n, err := r.Reader.ReadAt(p, off)
+	if off == r.offset {
+		r.cancel()
+	}
+	return n, err
+}
+
+func assertActiveMetadataPreserved(t testing.TB, input, output []byte, name string, preserve bool) {
+	t.Helper()
+	before, err := readFile(context.Background(), bytes.NewReader(input), int64(len(input)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := readFile(context.Background(), bytes.NewReader(output), int64(len(output)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := -1
+	for i, s := range before.sections {
+		if s.Type == uint32(elf.SHT_NULL) {
+			continue
+		}
+		start := uint64(s.Name)
+		end := start + uint64(len(name))
+		if end < uint64(len(before.names)) && before.names[end] == 0 && bytes.Equal(before.names[start:end], []byte(name)) {
+			target = i
+		}
+	}
+	detach := target < 0 && preserve && before.shoff != 0
+	count := len(before.sections)
+	if target < 0 {
+		count++
+		if detach {
+			count++
+		}
+	}
+	if len(after.sections) != count {
+		t.Fatalf("section count=%d want=%d", len(after.sections), count)
+	}
+	if !detach && after.shstrndx != before.shstrndx {
+		t.Fatal("selected name-table index changed")
+	}
+	for i, want := range before.sections {
+		got := after.sections[i]
+		if i == 0 {
+			got.Size, want.Size, got.Link, want.Link = 0, 0, 0, 0
+		}
+		if i == target {
+			got.Type, want.Type = 0, 0
+			got.Flags, want.Flags = 0, 0
+			got.Addralign, want.Addralign = 0, 0
+			got.Off, want.Off, got.Size, want.Size = 0, 0, 0, 0
+		}
+		if target < 0 && i == before.shstrndx && !detach {
+			got.Off, want.Off, got.Size, want.Size = 0, 0, 0, 0
+		}
+		if got != want {
+			t.Fatalf("active section %d metadata changed: got=%+v want=%+v", i, got, want)
+		}
+	}
+	if !bytes.HasPrefix(after.names, before.names) {
+		t.Fatal("original numeric name offsets changed")
+	}
+}

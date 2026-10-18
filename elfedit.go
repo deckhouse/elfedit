@@ -15,6 +15,10 @@ import (
 
 type SectionOptions struct {
 	// Zero Type means SHT_PROGBITS. Zero Alignment means byte alignment.
+	// New sections cannot use SHF_MERGE/SHF_STRINGS or types SHT_SYMTAB,
+	// SHT_DYNSYM, SHT_REL, SHT_RELA, SHT_HASH, SHT_DYNAMIC, SHT_GROUP,
+	// SHT_SYMTAB_SHNDX or SHT_RELR: required Entsize/Link/Info metadata cannot
+	// be supplied here. Existing sections retain those fields on replacement.
 	Type      elf.SectionType
 	Flags     elf.SectionFlag
 	Alignment uint64
@@ -77,11 +81,15 @@ func WriteSection(ctx context.Context, dst io.Writer, src io.ReaderAt, size int6
 	}
 	index := -1
 	for i, s := range f.sections {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if s.Type == uint32(elf.SHT_NULL) {
 			continue
 		}
-		end := bytes.IndexByte(f.names[s.Name:], 0)
-		if string(f.names[int(s.Name):int(s.Name)+end]) != name {
+		start := uint64(s.Name)
+		end := start + uint64(len(name))
+		if end >= uint64(len(f.names)) || f.names[end] != 0 || !bytes.Equal(f.names[start:end], []byte(name)) {
 			continue
 		}
 		if index >= 0 {
@@ -91,6 +99,26 @@ func WriteSection(ctx context.Context, dst io.Writer, src io.ReaderAt, size int6
 	}
 	if index == f.shstrndx {
 		return fmt.Errorf("edit ELF: cannot replace the section-name table")
+	}
+	if index < 0 {
+		if flags := opts.Flags & (elf.SHF_MERGE | elf.SHF_STRINGS); flags != 0 {
+			return fmt.Errorf("edit ELF: cannot create section with %s: Entsize is unavailable in SectionOptions", flags)
+		}
+		var required string
+		kind := opts.Type.String()
+		switch opts.Type {
+		case elf.SHT_SYMTAB, elf.SHT_DYNSYM, elf.SHT_GROUP:
+			required = "Entsize, Link and Info"
+		case elf.SHT_REL, elf.SHT_RELA, elf.SHT_DYNAMIC, elf.SHT_SYMTAB_SHNDX:
+			required = "Entsize and Link"
+		case elf.SHT_HASH:
+			required = "Link"
+		case elf.SectionType(19):
+			kind, required = "SHT_RELR", "Entsize"
+		}
+		if required != "" {
+			return fmt.Errorf("edit ELF: cannot create %s: required metadata (%s) is unavailable in SectionOptions", kind, required)
+		}
 	}
 	preserveNames := opts.PreserveSectionNameTable && f.shoff != 0
 	if index >= 0 {
@@ -292,7 +320,7 @@ func readFile(ctx context.Context, src io.ReaderAt, size int64) (*file, error) {
 		return nil, fmt.Errorf("read ELF: truncated identification")
 	}
 	ident := make([]byte, 16)
-	if _, err := src.ReadAt(ident, 0); err != nil {
+	if err := readAt(src, ident, 0); err != nil {
 		return nil, fmt.Errorf("read ELF identification: %w", err)
 	}
 	if string(ident[:4]) != elf.ELFMAG || ident[elf.EI_VERSION] != byte(elf.EV_CURRENT) {
@@ -334,7 +362,7 @@ func readFile(ctx context.Context, src io.ReaderAt, size int64) (*file, error) {
 	if version != uint32(elf.EV_CURRENT) || int(ehsize) != len(f.header) {
 		return nil, fmt.Errorf("read ELF: invalid header version or size")
 	}
-	if _, err := src.ReadAt(f.header, 0); err != nil {
+	if err := readAt(src, f.header, 0); err != nil {
 		return nil, fmt.Errorf("read ELF header: %w", err)
 	}
 	if shoff == 0 {
@@ -393,15 +421,17 @@ func readFile(ctx context.Context, src io.ReaderAt, size int64) (*file, error) {
 			f.sections[i] = s
 		}
 		str := f.sections[f.shstrndx]
-		if str.Type != uint32(elf.SHT_STRTAB) || str.Size == 0 || str.Size > math.MaxUint32 || str.Size > uint64(math.MaxInt) {
+		if str.Type != uint32(elf.SHT_STRTAB) || str.Size > math.MaxUint32 || str.Size > uint64(math.MaxInt) {
 			return nil, fmt.Errorf("read ELF: invalid section-name table")
 		}
 		if str.Flags&uint64(elf.SHF_COMPRESSED) != 0 {
 			return nil, fmt.Errorf("read ELF: compressed section-name table is unsupported")
 		}
-		f.names = make([]byte, int(str.Size))
-		if _, err := src.ReadAt(f.names, int64(str.Off)); err != nil {
-			return nil, fmt.Errorf("read section names: %w", err)
+		f.names = make([]byte, max(1, int(str.Size)))
+		if str.Size != 0 {
+			if err := readAt(src, f.names, int64(str.Off)); err != nil {
+				return nil, fmt.Errorf("read section names: %w", err)
+			}
 		}
 		if f.names[0] != 0 || f.names[len(f.names)-1] != 0 {
 			return nil, fmt.Errorf("read ELF: section names must start and end with NUL")
@@ -430,11 +460,17 @@ func readFile(ctx context.Context, src io.ReaderAt, size int64) (*file, error) {
 			if err := decode(src, size, offset, f.order, &p); err != nil {
 				return nil, err
 			}
+			if p.Type == uint32(elf.PT_NULL) {
+				continue
+			}
 			segment = span{uint64(p.Off), uint64(p.Filesz)}
 		} else {
 			var p elf.Prog64
 			if err := decode(src, size, offset, f.order, &p); err != nil {
 				return nil, err
+			}
+			if p.Type == uint32(elf.PT_NULL) {
+				continue
 			}
 			segment = span{p.Off, p.Filesz}
 		}
@@ -523,6 +559,20 @@ func (f *file) wordSize() int {
 		return 4
 	}
 	return 8
+}
+
+func readAt(src io.ReaderAt, data []byte, offset int64) error {
+	n, err := src.ReadAt(data, offset)
+	if n == len(data) && err == io.EOF {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if n != len(data) {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
 }
 
 func decode(src io.ReaderAt, size int64, offset uint64, order binary.ByteOrder, value any) error {
