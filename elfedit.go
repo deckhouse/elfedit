@@ -21,6 +21,12 @@ type SectionOptions struct {
 	// MaxOutputSize bounds the complete output, including padding and tables.
 	// Zero means no caller-imposed limit. It is not a metadata memory limit.
 	MaxOutputSize uint64
+	// PreserveSectionNameTable leaves an existing name table unchanged when
+	// adding a section, selecting a new nonallocated .shstrtab instead. Existing
+	// .shstrtab sections are retained, so name-based lookup can become ambiguous.
+	// Replacements and files without a section table are unaffected. Adding an
+	// absent target named .shstrtab with this option is rejected.
+	PreserveSectionNameTable bool
 }
 
 // SetSection adds or replaces name with opaque data and the supplied metadata.
@@ -86,9 +92,14 @@ func WriteSection(ctx context.Context, dst io.Writer, src io.ReaderAt, size int6
 	if index == f.shstrndx {
 		return fmt.Errorf("edit ELF: cannot replace the section-name table")
 	}
+	preserveNames := opts.PreserveSectionNameTable && f.shoff != 0
 	if index >= 0 {
 		if err := f.movable(f.sections[index]); err != nil {
 			return fmt.Errorf("replace %q: %w", name, err)
+		}
+	} else if preserveNames {
+		if name == ".shstrtab" {
+			return fmt.Errorf("edit ELF: cannot add .shstrtab while preserving the section-name table")
 		}
 	} else {
 		if err := f.movable(f.sections[f.shstrndx]); err != nil {
@@ -112,13 +123,22 @@ func WriteSection(ctx context.Context, dst io.Writer, src io.ReaderAt, size int6
 	var newNames []byte
 	var namesOffset uint64
 	if index < 0 {
-		if uint64(len(f.names))+uint64(len(name))+1 > math.MaxUint32 {
+		namesSize := uint64(len(f.names)) + uint64(len(name)) + 1
+		if preserveNames {
+			namesSize += uint64(len(".shstrtab")) + 1
+		}
+		if namesSize > math.MaxUint32 {
 			return fmt.Errorf("edit ELF: section names exceed 32 bits")
 		}
 		index = len(f.sections)
 		f.sections = append(f.sections, elf.Section64{Name: uint32(len(f.names))})
 		newNames = append(bytes.Clone(f.names), name...)
 		newNames = append(newNames, 0)
+		if preserveNames {
+			f.shstrndx = len(f.sections)
+			f.sections = append(f.sections, elf.Section64{Name: uint32(len(newNames)), Type: uint32(elf.SHT_STRTAB), Addralign: 1})
+			newNames = append(newNames, ".shstrtab\x00"...)
+		}
 		namesAlignment := max(f.sections[f.shstrndx].Addralign, 1)
 		if namesAlignment&(namesAlignment-1) != 0 {
 			return fmt.Errorf("edit ELF: invalid section-name alignment")
