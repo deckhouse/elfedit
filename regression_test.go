@@ -7,6 +7,7 @@ import (
 	"debug/elf"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"testing"
@@ -171,47 +172,48 @@ func TestReplaceInPlaceRejectsOverlaps(t *testing.T) {
 }
 
 func TestExtendedProgramCount(t *testing.T) {
-	const count = 0x10000
 	for _, enc := range encodings {
-		t.Run(enc.name, func(t *testing.T) {
-			input := fixture(t, enc, elf.EM_ARM, 5, false)
-			putFixtureSection(t, enc, input, 0, elf.Section64{Info: count})
-			phoff := len(input)
-			var segment any = elf.Prog64{Type: uint32(elf.PT_NOTE), Off: 256, Filesz: 29}
-			if enc.class == elf.ELFCLASS32 {
-				segment = elf.Prog32{Type: uint32(elf.PT_NOTE), Off: 256, Filesz: 29}
-				enc.order.PutUint32(input[28:32], uint32(phoff))
-				enc.order.PutUint16(input[44:46], 0xffff)
-			} else {
-				enc.order.PutUint64(input[32:40], uint64(phoff))
-				enc.order.PutUint16(input[56:58], 0xffff)
-			}
-			phsize := binary.Size(segment)
-			input = append(input, make([]byte, count*phsize)...)
-			out, err := SetSection(context.Background(), input, ".extra", []byte("data"), SectionOptions{})
-			if err != nil {
-				t.Fatal(err)
-			}
-			assertPreserved(t, input, out)
-			off, _ := sectionTable(t, enc, out)
-			infoOffset := 44
-			if enc.class == elf.ELFCLASS32 {
-				infoOffset = 28
-			}
-			if got := enc.order.Uint32(out[off+infoOffset:]); got != count {
-				t.Fatalf("extended program count=%d, want %d", got, count)
-			}
-			var p bytes.Buffer
-			if err := binary.Write(&p, enc.order, segment); err != nil {
-				t.Fatal(err)
-			}
-			copy(input[phoff+(count-1)*phsize:], p.Bytes())
-			var rejected bytes.Buffer
-			err = WriteSection(context.Background(), &rejected, bytes.NewReader(input), int64(len(input)), ".extra", nil, SectionOptions{})
-			if err == nil || rejected.Len() != 0 {
-				t.Fatalf("last extended program segment ignored: err=%v bytes=%d", err, rejected.Len())
-			}
-		})
+		for _, count := range []uint32{0xffff, 0x10000} {
+			t.Run(fmt.Sprintf("%s/%d", enc.name, count), func(t *testing.T) {
+				input := fixture(t, enc, elf.EM_ARM, 5, false)
+				putFixtureSection(t, enc, input, 0, elf.Section64{Info: count})
+				phoff := len(input)
+				var segment any = elf.Prog64{Type: uint32(elf.PT_NOTE), Off: 256, Filesz: 29}
+				if enc.class == elf.ELFCLASS32 {
+					segment = elf.Prog32{Type: uint32(elf.PT_NOTE), Off: 256, Filesz: 29}
+					enc.order.PutUint32(input[28:32], uint32(phoff))
+					enc.order.PutUint16(input[44:46], 0xffff)
+				} else {
+					enc.order.PutUint64(input[32:40], uint64(phoff))
+					enc.order.PutUint16(input[56:58], 0xffff)
+				}
+				phsize := binary.Size(segment)
+				input = append(input, make([]byte, int(count)*phsize)...)
+				out, err := SetSection(context.Background(), input, ".extra", []byte("data"), SectionOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertPreserved(t, input, out)
+				off, _ := sectionTable(t, enc, out)
+				infoOffset := 44
+				if enc.class == elf.ELFCLASS32 {
+					infoOffset = 28
+				}
+				if got := enc.order.Uint32(out[off+infoOffset:]); got != count {
+					t.Fatalf("extended program count=%d, want %d", got, count)
+				}
+				var p bytes.Buffer
+				if err := binary.Write(&p, enc.order, segment); err != nil {
+					t.Fatal(err)
+				}
+				copy(input[phoff+int(count-1)*phsize:], p.Bytes())
+				var rejected bytes.Buffer
+				err = WriteSection(context.Background(), &rejected, bytes.NewReader(input), int64(len(input)), ".extra", nil, SectionOptions{})
+				if err == nil || rejected.Len() != 0 {
+					t.Fatalf("last extended program segment ignored: err=%v bytes=%d", err, rejected.Len())
+				}
+			})
+		}
 	}
 }
 
@@ -325,5 +327,129 @@ func TestInterruptedOutput(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestAppendedReplacementMetadata(t *testing.T) {
+	for _, enc := range encodings {
+		for _, align := range []uint64{1, 2048} {
+			t.Run(fmt.Sprintf("%s/align%d", enc.name, align), func(t *testing.T) {
+				input := fixture(t, enc, elf.EM_ARM, 5, false)
+				original := elf.Section64{Name: 22, Type: uint32(elf.SHT_PROGBITS), Flags: uint64(elf.SHF_LINK_ORDER | elf.SHF_INFO_LINK), Off: 640, Size: 8, Link: 2, Info: 3, Entsize: 8, Addralign: 8}
+				putFixtureSection(t, enc, input, 4, original)
+				payload := bytes.Repeat([]byte{7}, 16)
+				if align == 2048 {
+					payload = payload[:8]
+				}
+				opts := SectionOptions{Flags: elf.SHF_LINK_ORDER | elf.SHF_INFO_LINK, Alignment: align}
+				out, err := SetSection(context.Background(), input, ".extra", payload, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var streamed bytes.Buffer
+				if err := WriteSection(context.Background(), &streamed, bytes.NewReader(input), int64(len(input)), ".extra", payload, opts); err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(out, streamed.Bytes()) {
+					t.Fatal("APIs differ")
+				}
+				after := openELF(t, out).Sections[4]
+				if after.Offset < uint64(len(input)) {
+					t.Fatal("fixture did not force append")
+				}
+				if after.Link != original.Link || after.Info != original.Info || after.Entsize != original.Entsize || after.Addr != original.Addr {
+					t.Fatalf("appended replacement lost metadata: %+v", after.SectionHeader)
+				}
+				assertPreserved(t, input, out)
+				again, err := SetSection(context.Background(), out, ".extra", payload, opts)
+				if err != nil || !bytes.Equal(again, out) {
+					t.Fatalf("same-size repeat changed bytes: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestUnusedProgramHeaders(t *testing.T) {
+	for _, enc := range encodings {
+		for _, off := range []uint64{256, 640, 1024, math.MaxUint32} {
+			t.Run(fmt.Sprintf("%s/%d", enc.name, off), func(t *testing.T) {
+				input := fixture(t, enc, elf.EM_ARM, 5, false)
+				putFixtureSection(t, enc, input, 4, elf.Section64{Name: 22, Type: uint32(elf.SHT_PROGBITS), Off: 640, Size: 8, Addralign: 1})
+				var p bytes.Buffer
+				phoff := 64
+				if enc.class == elf.ELFCLASS32 {
+					phoff = 52
+					enc.order.PutUint16(input[44:46], 2)
+					if err := binary.Write(&p, enc.order, elf.Prog32{Type: uint32(elf.PT_NULL), Flags: 7, Off: uint32(off), Filesz: 29}); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					enc.order.PutUint16(input[56:58], 2)
+					if off == math.MaxUint32 {
+						off = math.MaxUint64
+					}
+					if err := binary.Write(&p, enc.order, elf.Prog64{Type: uint32(elf.PT_NULL), Flags: 7, Off: off, Filesz: 29}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				copy(input[phoff+p.Len():], p.Bytes())
+				for _, name := range []string{".new", ".extra"} {
+					out, err := SetSection(context.Background(), input, name, []byte("replaced"), SectionOptions{})
+					if err != nil {
+						t.Fatal(err)
+					}
+					assertSectionEditPreserved(t, input, out, name)
+					if name == ".extra" && len(out) != len(input) {
+						t.Fatal("unused geometry prevented in-place replacement")
+					}
+					var streamed bytes.Buffer
+					if err := WriteSection(context.Background(), &streamed, bytes.NewReader(input), int64(len(input)), name, []byte("replaced"), SectionOptions{}); err != nil || !bytes.Equal(streamed.Bytes(), out) {
+						t.Fatalf("streaming differs: %v", err)
+					}
+				}
+				// The same out-of-file geometry on a real segment must still fail.
+				if off >= math.MaxUint32 {
+					enc.order.PutUint32(input[phoff+p.Len():], uint32(elf.PT_LOAD))
+					var dst bytes.Buffer
+					if err := WriteSection(context.Background(), &dst, bytes.NewReader(input), int64(len(input)), ".new", nil, SectionOptions{}); err == nil || dst.Len() != 0 {
+						t.Fatal("accepted real segment outside file")
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestUnusedProgramTableProtection(t *testing.T) {
+	for _, enc := range encodings {
+		for _, tableAlias := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/table=%v", enc.name, tableAlias), func(t *testing.T) {
+				input := fixture(t, enc, elf.EM_ARM, 5, false)
+				phoff := 64
+				if enc.class == elf.ELFCLASS32 {
+					phoff = 52
+				}
+				targetOff := uint64(phoff)
+				enc.order.PutUint32(input[phoff:], uint32(elf.PT_NULL))
+				if tableAlias {
+					targetOff = 640
+					if enc.class == elf.ELFCLASS32 {
+						enc.order.PutUint32(input[28:32], 1024)
+					} else {
+						enc.order.PutUint64(input[32:40], 1024)
+					}
+				}
+				putFixtureSection(t, enc, input, 4, elf.Section64{Name: 22, Type: uint32(elf.SHT_PROGBITS), Off: targetOff, Size: 8, Addralign: 1})
+				out, err := SetSection(context.Background(), input, ".extra", []byte("replaced"), SectionOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertPreserved(t, input, out)
+				if openELF(t, out).Section(".extra").Offset < uint64(len(input)) {
+					t.Fatal("overwrote physical program table")
+				}
+			})
+		}
 	}
 }

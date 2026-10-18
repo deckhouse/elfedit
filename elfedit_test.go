@@ -280,6 +280,10 @@ func FuzzSetSection(f *testing.F) {
 		copy(inactive[256+22:], []byte(".fuzz\x00"))
 		putFixtureSection(f, enc, inactive, 4, elf.Section64{Name: 22})
 		f.Add(inactive)
+		replacement := fixture(f, enc, elf.EM_ARM, 5, false)
+		copy(replacement[256+22:], []byte(".fuzz\x00"))
+		putFixtureSection(f, enc, replacement, 4, elf.Section64{Name: 22, Type: uint32(elf.SHT_PROGBITS), Off: 640, Size: 8, Link: 2, Info: 3, Entsize: 1, Addralign: 1})
+		f.Add(replacement)
 	}
 	f.Add([]byte("not ELF"))
 	f.Fuzz(func(t *testing.T, input []byte) {
@@ -289,6 +293,7 @@ func FuzzSetSection(f *testing.F) {
 				continue
 			}
 			assertSectionEditPreserved(t, input, out, ".fuzz")
+			assertActiveMetadataPreserved(t, input, out, ".fuzz", preserve)
 			// The editor preserves opaque metadata that debug/elf may reject already
 			// in the input (e.g. undefined fields of inactive SHT_NULL entries).
 			before, err := elf.NewFile(bytes.NewReader(input))
